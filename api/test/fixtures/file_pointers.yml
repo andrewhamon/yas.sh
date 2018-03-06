@@ -1,0 +1,11 @@
+# Read about fixtures at http://api.rubyonrails.org/classes/ActiveRecord/FixtureSet.html
+
+one:
+  path: MyString
+  bucket_path: MyString
+  revision: one
+
+two:
+  path: MyString
+  bucket_path: MyString
+  revision: two

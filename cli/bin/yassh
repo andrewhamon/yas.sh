@@ -1,0 +1,160 @@
+#!/usr/bin/env ruby
+
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'net/http'
+
+require 'commander/import'
+require "mimemagic"
+require 'rest-client'
+
+program :description, 'CLI for publishing websites to yas.sh'
+program :version, "1.0.0"
+
+class RestClient::Response
+  def json
+    JSON.parse(body)
+  end
+end
+
+$api = RestClient::Resource.new("https://api.yas.sh", headers: {content_type: 'application/json; charset=utf-8', accept: 'application/json'})
+
+def load_default_domain
+  File.read("CNAME").strip.split.first
+rescue
+  nil
+end
+
+def load_default_token
+  dir_path = File.join(ENV["HOME"], ".config/yassh/")
+  path = File.join(dir_path, "access_token")
+  File.read(path).strip.split.first
+rescue
+  nil
+end
+
+def create_site(domain, token)
+  $api['/sites'].post({ domain: domain }.to_json, {Authorization: "Bearer #{token}"}).json
+end
+
+def create_revision(domain, token)
+  $api["/sites/#{domain}/revisions"].post("", {Authorization: "Bearer #{token}"}).json["revision"]["number"]
+end
+
+def post_file(domain, revision, metadata, token)
+  $api["/sites/#{domain}/revisions/#{revision}/files"].post(metadata.to_json, {Authorization: "Bearer #{token}"}).json
+end
+
+def commit_revision(domain, revision, token)
+  $api["/sites/#{domain}/revisions/#{revision}/commit"].post("", {Authorization: "Bearer #{token}"}).json
+end
+
+def authenticate(email, password)
+  $api["/auth"].post({username: email, password: password}.to_json).json
+end
+
+def signup(email, password)
+  $api["/accounts"].post({email: email, password: password}.to_json).json
+end
+
+command :signup do |c|
+  c.syntax = "yassh signup"
+  c.description = "Create a user account and store API key in ~/.config/yassh/"
+  c.action do |args, opts|
+    email = ask("Email: ")
+    pass = password
+
+    begin
+      signup(email, pass)
+      result = authenticate(email, pass)
+      dir_path = File.join(ENV["HOME"], ".config/yassh/")
+      FileUtils.mkdir_p(dir_path)
+      path = File.join(dir_path, "access_token")
+      File.write(path, result["access_token"] + "\n")
+      puts "Access token written to: #{path}"
+    # rescue RestClient::RequestFailed
+    #   puts "Failed to signup"
+    end
+  end
+end
+
+command :auth do |c|
+  c.syntax = "yassh auth"
+  c.description = "Authenticate your user account and store API key in ~/.config/yassh/"
+  c.action do |args, opts|
+    email = ask("Email: ")
+    pass = password
+
+    begin
+      result = authenticate(email, pass)
+      dir_path = File.join(ENV["HOME"], ".config/yassh/")
+      FileUtils.mkdir_p(dir_path)
+      path = File.join(dir_path, "access_token")
+      File.write(path, result["access_token"] + "\n")
+      puts "Access token written to: #{path}"
+    rescue RestClient::RequestFailed
+      puts "Incorrect email or password"
+    end
+  end
+end
+
+command :push do |c|
+  c.syntax = "yassh push [options]"
+  c.description = "Create a new revision and recursively upload files"
+  c.option '-d', '--domain DOMAIN', String, 'Domain to push site to (default loaded from CNAME)'
+  c.option '--root PATH', String, 'Root directory for the website (default .)'
+  c.option '--token TOKEN', String, 'Yassh access token'
+  c.action do |args, opts|
+    opts.default domain: load_default_domain, root: Dir.pwd, token: load_default_token
+
+    create_site(opts.domain, opts.token)
+
+    print "Creating revision ... "
+    revision_number = create_revision(opts.domain, opts.token)
+    puts "#{opts.domain} v#{revision_number}"
+
+    failure_encountered = false
+
+
+    Dir.chdir opts.root
+    Dir.glob("**/*") do |path|
+      payload = File.open(path) do |f|
+        metadata = {
+          domain: opts.domain,
+          size: f.size,
+          md5: Digest::MD5.file(f).hexdigest,
+          path: path,
+          content_type: (MimeMagic.by_path(path) || MimeMagic.by_magic(f) || 'application/octet-stream').to_s
+        }
+
+        print "Uploading #{path} ... "
+
+        begin
+          response = post_file(opts.domain, revision_number, metadata, opts.token)
+          if response["file"]["new_file"]
+            RestClient.put response["file"]["upload_url"], f, content_type: metadata[:content_type]
+            puts "SUCCESS"
+          else
+            puts "EXISTS"
+          end
+        rescue RestClient::RequestFailed
+          failure_encountered = true
+          puts "FAILED"
+        end
+      end
+    end
+
+    force_commit = false
+    if failure_encountered
+      force_commit = agree("Failed to succesfuly upload all files. Would you still like to commit this version?")
+    end
+
+    if force_commit || !failure_encountered
+      print "Committing #{opts.domain} v#{revision_number} ... "
+
+      commit_revision(opts.domain, revision_number, opts.token)
+      puts "SUCCESS"
+    end
+  end
+end

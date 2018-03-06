@@ -1,0 +1,302 @@
+daemon off;
+
+# Configuration File - Nginx Server Configs
+# http://nginx.org/en/docs/dirindex.html
+
+# Run as a unique, less privileged user for security reasons.
+# Default: nobody nobody
+user root root;
+
+# Sets the worker threads to the number of CPU cores available in the system for best performance.
+# Should be > the number of CPU cores.
+# Maximum number of connections = worker_processes * worker_connections
+# Default: 1
+worker_processes auto;
+
+# Maximum number of open files per worker process.
+# Should be > worker_connections.
+# Default: no limit
+worker_rlimit_nofile 8192;
+
+events {
+  # Should be < worker_rlimit_nofile.
+  # Default: 512
+  worker_connections 8000;
+}
+
+
+http {
+  server_tokens off;
+  default_type  application/octet-stream;
+
+  log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent" "$http_x_forwarded_for"';
+
+  access_log /dev/stdout main;
+  error_log  /dev/stderr debug;
+
+  # How long to allow each connection to stay idle.
+  # Longer values are better for each individual client, particularly for SSL,
+  # but means that worker connections are tied up longer.
+  # Default: 75s
+  keepalive_timeout 20s;
+
+
+  # Speed up file transfers by using sendfile() to copy directly
+  # between descriptors rather than using read()/write().
+  # For performance reasons, on FreeBSD systems w/ ZFS
+  # this option should be disabled as ZFS's ARC caches
+  # frequently used files in RAM by default.
+  # Default: off
+  sendfile        on;
+
+  # Don't send out partial frames; this increases throughput
+  # since TCP frames are filled up before being sent out.
+  # Default: off
+  tcp_nopush      on;
+
+  # Enable gzip compression.
+  # Default: off
+  gzip on;
+
+  # Compression level (1-9).
+  # 5 is a perfect compromise between size and CPU usage, offering about
+  # 75% reduction for most ASCII files (almost identical to level 9).
+  # Default: 1
+  gzip_comp_level    5;
+
+  # Don't compress anything that's already small and unlikely to shrink much
+  # if at all (the default is 20 bytes, which is bad as that usually leads to
+  # larger files after gzipping).
+  # Default: 20
+  gzip_min_length    256;
+
+  # Compress data even for clients that are connecting to us via proxies,
+  # identified by the "Via" header (required for CloudFront).
+  # Default: off
+  gzip_proxied       any;
+
+  # Tell proxies to cache both the gzipped and regular version of a resource
+  # whenever the client's Accept-Encoding capabilities header varies;
+  # Avoids the issue where a non-gzip capable client (which is extremely rare
+  # today) would display gibberish if their proxy gave them the gzipped version.
+  # Default: off
+  gzip_vary          on;
+
+  # Compress all output labeled with one of the following MIME-types.
+  # text/html is always compressed by gzip module.
+  # Default: text/html
+  gzip_types
+    application/atom+xml
+    application/javascript
+    application/json
+    application/ld+json
+    application/manifest+json
+    application/rss+xml
+    application/vnd.geo+json
+    application/vnd.ms-fontobject
+    application/x-font-ttf
+    application/x-web-app-manifest+json
+    application/xhtml+xml
+    application/xml
+    font/opentype
+    image/bmp
+    image/svg+xml
+    image/x-icon
+    text/cache-manifest
+    text/css
+    text/plain
+    text/vcard
+    text/vnd.rim.location.xloc
+    text/vtt
+    text/x-component
+    text/x-cross-domain-policy;
+
+  proxy_cache_path /tmp/cache levels=1:2 keys_zone=yas_cache:100m max_size=10g
+                   inactive=1y use_temp_path=off;
+
+
+  resolver 8.8.8.8;
+
+  # The "auto_ssl" shared dict should be defined with enough storage space to
+  # hold your certificate data. 1MB of storage holds certificates for
+  # approximately 100 separate domains.
+  lua_shared_dict auto_ssl 1m;
+  # The "auto_ssl" shared dict is used to temporarily store various settings
+  # like the secret used by the hook server on port 8999. Do not change or
+  # omit it.
+  lua_shared_dict auto_ssl_settings 64k;
+
+  init_by_lua_block {
+    auto_ssl = (require "resty.auto-ssl").new()
+
+    -- Define a function to determine which SNI domains to automatically handle
+    -- and register new certificates for. Defaults to not allowing any domains,
+    -- so this must be configured.
+    auto_ssl:set("allow_domain", function(domain)
+      return true
+    end)
+
+    auto_ssl:set("storage_adapter", "resty.auto-ssl.storage_adapters.redis")
+
+    auto_ssl:set("redis", {
+      host = "127.0.0.1",
+      port = 6379,
+      auth = "<%= ENV.fetch('REDIS_PASSWORD') %>",
+      prefix = "resty-auto-ssl:"
+    })
+
+    auto_ssl:init()
+  }
+
+  init_worker_by_lua_block {
+    auto_ssl:init_worker()
+  }
+
+  upstream yassh_api {
+    server <%= ENV.fetch('API_HOST') %>;
+  }
+
+  server {
+    listen 443 ssl;
+    ssl_certificate_by_lua_block {
+      auto_ssl:ssl_certificate()
+    }
+    ssl_certificate /etc/ssl/resty-auto-ssl-fallback.crt;
+    ssl_certificate_key /etc/ssl/resty-auto-ssl-fallback.key;
+
+    server_name api.yas.sh;
+
+    location / {
+      proxy_pass http://yassh_api;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header Host $http_host;
+      proxy_redirect off;
+    }
+  }
+
+
+  server {
+    listen 443 ssl default_server;
+    ssl_certificate_by_lua_block {
+      auto_ssl:ssl_certificate()
+    }
+    ssl_certificate /etc/ssl/resty-auto-ssl-fallback.crt;
+    ssl_certificate_key /etc/ssl/resty-auto-ssl-fallback.key;
+
+    recursive_error_pages  on;
+
+    proxy_ssl_server_name  on;
+    proxy_intercept_errors on;
+
+    proxy_http_version 1.1;
+
+    proxy_hide_header      x-amz-id-2;
+    proxy_hide_header      x-amz-request-id;
+    proxy_hide_header      x-amz-meta-server-side-encryption;
+    proxy_hide_header      x-amz-server-side-encryption;
+    proxy_hide_header      x-amz-meta-account_id;
+    proxy_hide_header      x-amz-meta-domain;
+    proxy_hide_header      x-amz-meta-path;
+    proxy_hide_header      x-amz-meta-revision;
+    proxy_hide_header      Set-Cookie;
+
+    proxy_ignore_headers   Set-Cookie;
+
+
+
+    proxy_cache_lock on;
+    proxy_cache_revalidate on;
+    proxy_cache yas_cache;
+    proxy_cache_valid 200 301 302 404 1y;
+    proxy_cache_valid any 1m;
+    proxy_cache_key $upstream_path;
+
+    add_header X-Cache-Status $upstream_cache_status;
+
+    rewrite ^/(.*)/$ /$1 permanent;
+    rewrite ^/index.html$ / permanent;
+    rewrite ^/index.htm$ / permanent;
+    rewrite ^/(.*)/index\.html$ /$1 permanent;
+    rewrite ^/(.*)/index\.htm$ /$1 permanent;
+    rewrite ^/(.*)\.html$ /$1 permanent;
+    rewrite ^/(.*)\.htm$ /$1 permanent;
+
+    location / {
+      default_type  text/plain;
+
+      set $redis_host     '127.0.0.1';
+      set $redis_port     '6379';
+      set $redis_password '<%= ENV.fetch('REDIS_PASSWORD') %>';
+
+      set $upstream_bucket '<%= ENV.fetch('UPSTREAM_BUCKET') %>';
+      set $upstream_path     '';
+
+      access_by_lua_file "lookup.lua";
+
+      error_page 404 /customer404;
+
+      proxy_pass https://s3.amazonaws.com/${upstream_bucket}/${upstream_path};
+    }
+
+    location /customer404 {
+      internal;
+      default_type  text/plain;
+      error_page 404 /internal404;
+
+      if ($upstream_path = '') {
+        rewrite ^ /internal404;
+        return 404;
+      }
+
+      proxy_pass https://s3.amazonaws.com/${upstream_bucket}/${upstream_path};
+    }
+
+    location /internal404 {
+      internal;
+      root /usr/local/openresty/nginx/html;
+      try_files /404.html = 404;
+    }
+  }
+
+  server {
+    listen 80;
+
+    # Endpoint used for performing domain prevalidation so as not to
+    # waste rate limits on domains that won't validate
+    location /.well-known/yassh-challenge/ {
+      proxy_pass http://yassh_api;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header Host $http_host;
+      proxy_redirect off;
+    }
+
+    # Endpoint used for performing domain verification with Let's Encrypt.
+    location /.well-known/acme-challenge/ {
+      content_by_lua_block {
+        auto_ssl:challenge_server()
+      }
+    }
+
+    location / {
+      return 301 https://$host$request_uri;
+    }
+  }
+
+  # Internal server running on port 8999 for handling certificate tasks.
+  server {
+    listen 127.0.0.1:8999;
+
+    # Increase the body buffer size, to ensure the internal POSTs can always
+    # parse the full POST contents into memory.
+    client_body_buffer_size 128k;
+    client_max_body_size 128k;
+
+    location / {
+      content_by_lua_block {
+        auto_ssl:hook_server()
+      }
+    }
+  }
+}

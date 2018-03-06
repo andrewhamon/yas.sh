@@ -1,0 +1,4 @@
+client=yes
+[redis-cli]
+accept=127.0.0.1:6379
+connect=<%= ENV.fetch("REDIS_SSL_HOST") %>
