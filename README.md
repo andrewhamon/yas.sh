@@ -1,5 +1,21 @@
 # Yassh: Yet Another Static Site Host
 
+## Usage
+
+```bash
+gem install yassh
+
+yassh signup # or yassh auth if you've already signed up
+
+mkdir my-cool-site
+cd my-cool-site
+
+echo "example.com" > CNAME
+echo "Hello world" > index.html
+
+yassh push
+```
+
 ## Simplified architectural diagram
 
 ```
